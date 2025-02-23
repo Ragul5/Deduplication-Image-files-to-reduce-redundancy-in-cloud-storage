@@ -1,0 +1,82 @@
+import os
+import hashlib
+import cv2
+from PIL import Image
+import imagehash
+from azure.storage.blob import BlobServiceClient
+
+def sha_1024_hash(image_path):
+    sha_1024 = hashlib.sha3_512()
+    with open(image_path, 'rb') as f:
+        while chunk := f.read(8192):
+            sha_1024.update(chunk)
+    return sha_1024.hexdigest()
+
+def perceptual_hash(image_path):
+    img = Image.open(image_path)
+    return imagehash.average_hash(img)
+
+def image_quality(image_path):
+    image = cv2.imread(image_path)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clarity_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    height, width = image.shape[:2]
+    resolution_score = height * width
+    return clarity_score, resolution_score
+
+def upload_to_azure(image_path, connection_string, container_name):
+    blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+    container_client = blob_service_client.get_container_client(container_name)
+    blob_name = os.path.basename(image_path)
+    
+    with open(image_path, 'rb') as f:
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(f, overwrite=True)
+    print(f"Uploaded {blob_name} to Azure.")
+
+def deduplicate_images(image_dir, azure_conn_string, azure_container):
+    hashes = {}
+    similar_images = {}
+
+    for image_file in os.listdir(image_dir):
+        image_path = os.path.join(image_dir, image_file)
+        if not image_path.lower().endswith(('png', 'jpg', 'jpeg', 'bmp')):
+            continue
+
+        sha_hash = sha_1024_hash(image_path)
+        if sha_hash in hashes:
+            print(f"Exact duplicate found: {image_file}")
+            continue
+
+        p_hash = perceptual_hash(image_path)
+        similar_found = False
+
+        for existing_hash, existing_file in hashes.items():
+            # Check similarity for perceptual hash
+            similarity = p_hash - existing_hash
+            if similarity <= 10:  # Adjust sensitivity as needed
+                print(f"Similar image found: {image_file} and {existing_file}")
+                similar_found = True
+                existing_quality, existing_resolution = image_quality(hashes[existing_hash])
+                current_quality, current_resolution = image_quality(image_path)
+
+                # Choose the better quality image
+                if current_quality > existing_quality and current_resolution > existing_resolution:
+                    similar_images[p_hash] = image_path
+                else:
+                    print(f"Keeping {existing_file}")
+                break
+
+        if not similar_found:
+            hashes[p_hash] = image_path
+
+    for _, img_path in hashes.items():
+        upload_to_azure(img_path, azure_conn_string, azure_container)
+
+if __name__ == "__main__":
+    local_path = input("Enter the local storage path of images: ")
+    azure_key = input("Enter your Azure Access Key: ")
+    azure_conn_string = input("Enter your Azure Connection String: ")
+    azure_container = input("Enter your Azure Container Name: ")
+
+    deduplicate_images(local_path, azure_conn_string, azure_container)
